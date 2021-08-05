@@ -7,7 +7,8 @@ from typing import Dict, Optional, Union, Tuple, List
 
 import hjson
 import parse
-from mcdreforged.api.all import *
+from mcdreforged.api.types import ServerInterface, Info
+from mcdreforged.api.rtext import RText, RTextTranslation
 
 PLUGIN_METADATA = {
 	'id': 'minecraft_data_api',
