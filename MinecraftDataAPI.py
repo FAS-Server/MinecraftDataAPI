@@ -12,7 +12,7 @@ from mcdreforged.api.rtext import RText, RTextTranslation
 
 PLUGIN_METADATA = {
 	'id': 'minecraft_data_api',
-	'version': '1.4.0',
+	'version': '1.4.0-dev0805',
 	'name': 'Minecraft Data API',
 	'description': 'A MCDReforged api plugin to get player data information and more',
 	'author': [
