@@ -12,16 +12,17 @@ from mcdreforged.api.rtext import RText, RTextTranslation
 
 PLUGIN_METADATA = {
 	'id': 'minecraft_data_api',
-	'version': '1.3.0',
+	'version': '1.4.0',
 	'name': 'Minecraft Data API',
 	'description': 'A MCDReforged api plugin to get player data information and more',
 	'author': [
-		'Fallen_Breath'
+		'Fallen_Breath', 'YehowahLiu'
 	],
 	'link': 'https://github.com/MCDReforged/MinecraftDataAPI'
 }
 
 DEFAULT_TIME_OUT = 5  # seconds
+RCON_FIRST = True
 
 
 class PlayerDataGetter:
@@ -42,7 +43,7 @@ class PlayerDataGetter:
 				self.work_queue[player] = self.QueueTask()
 			return self.work_queue[player]
 
-	def get_player_info(self, player: str, path: str, timeout: float):
+	def get_player_info(self, player: str, path: str, timeout: float, timeout_warn=True):
 		if self.server.is_on_executor_thread():
 			raise RuntimeError('Cannot invoke get_player_info on the task executor thread')
 		if len(path) >= 1 and not path.startswith(' '):
@@ -51,10 +52,14 @@ class PlayerDataGetter:
 		task = self.get_queue_task(player)
 		task.count += 1
 		try:
-			self.server.execute(command)
+			result = _do_query(self.server, command)
+			if _do_rcon(self.server):
+				self.on_info(result)
 			content = task.queue.get(timeout=timeout)
 		except Empty:
-			self.server.logger.warning('[{}] Query for player {} at path {} timeout'.format(PLUGIN_METADATA['name'], player, path))
+			if timeout_warn:
+				self.server.logger.warning('[{}] Query for player {} at path {} timeout'.format(
+					PLUGIN_METADATA['name'], player, path))
 			return None
 		finally:
 			task.count -= 1
@@ -67,13 +72,12 @@ class PlayerDataGetter:
 				err
 			))
 
-	def on_info(self, info: Info):
-		if not info.is_user:
-			if re.match(r'^\w+ has the following entity data: .*$', info.content):
-				player = info.content.split(' ')[0]
-				task = self.get_queue_task(player)
-				if task.count > 0:
-					task.queue.put(info.content)
+	def on_info(self, info: str):
+		if re.match(r'^\w+ has the following entity data: .*$', info):
+			player = info.split(' ')[0]
+			task = self.get_queue_task(player)
+			if task.count > 0:
+				task.queue.put(info)
 
 
 class MinecraftJsonParser:
@@ -168,7 +172,9 @@ class ServerDataGetter:
 		if self.server.is_on_executor_thread():
 			raise RuntimeError('Cannot invoke get_player_list on the task executor thread')
 		with self.player_list.with_querying():
-			self.server.execute('list')
+			result = _do_query(self.server, 'list')
+			if _do_rcon(self.server):
+				self.on_info(result)
 			try:
 				amount, limit, players = self.player_list.result_queue.get(timeout=timeout)
 			except Empty:
@@ -180,26 +186,32 @@ class ServerDataGetter:
 					players = []
 				return amount, limit, players
 
-	def on_info(self, info: Info):
-		if not info.is_user:
-			if self.player_list.is_querying():
-				formatters = (
-					# <1.16
-					# There are 6 of a max 100 players online: 122, abc, xxx, www, QwQ, bot_tob
-					r'There are {amount:d} of a max {limit:d} players online:{players}',
-					# >=1.16
-					# There are 1 of a max of 20 players online: Fallen_Breath
-					r'There are {amount:d} of a max of {limit:d} players online:{players}',
-				)
-				for formatter in formatters:
-					parsed = parse.parse(formatter, info.content)
-					if parsed is not None and parsed['players'].startswith(' '):
-						self.player_list.result_queue.put((parsed['amount'], parsed['limit'], parsed['players'][1:]))
-						break
+	def on_info(self, info: str):
+		if self.player_list.is_querying():
+			formatters = (
+				# <1.16
+				# There are 6 of a max 100 players online: 122, abc, xxx, www, QwQ, bot_tob
+				r'There are {amount:d} of a max {limit:d} players online:{players}',
+				# >=1.16
+				# There are 1 of a max of 20 players online: Fallen_Breath
+				r'There are {amount:d} of a max of {limit:d} players online:{players}',
+			)
+			for formatter in formatters:
+				parsed = parse.parse(formatter, info)
+				if parsed is not None and parsed['players'].startswith(' '):
+					self.player_list.result_queue.put((parsed['amount'], parsed['limit'], parsed['players'][1:]))
+					break
 
 
 player_data_getter = None  # type: Optional[PlayerDataGetter]
 server_data_getter = None  # type: Optional[ServerDataGetter]
+
+
+def _do_query(server: ServerInterface, cmd: str):
+	if _do_rcon(server):
+		return server.rcon_query(cmd)
+	else:
+		server.execute(cmd)
 
 
 def on_load(server, prev):
@@ -214,9 +226,17 @@ def on_load(server, prev):
 		server_data_getter.player_list = prev.server_data_getter.player_list
 
 
-def on_info(server: ServerInterface, info):
-	player_data_getter.on_info(info)
-	server_data_getter.on_info(info)
+def _do_rcon(server: ServerInterface):
+	return server.is_rcon_running() and RCON_FIRST
+
+
+def on_info(server: ServerInterface, info: Info):
+	if _do_rcon(server):
+		return
+	if info.is_user:
+		return
+	player_data_getter.on_info(info.content)
+	server_data_getter.on_info(info.content)
 
 
 # ------------------
@@ -232,7 +252,7 @@ def convert_minecraft_json(text: str):
 	return player_data_getter.json_parser.convert_minecraft_json(text)
 
 
-def get_player_info(player: str, data_path: str = '', *, timeout: Optional[float] = None):
+def get_player_info(player: str, data_path: str = '', *, timeout: Optional[float] = None, timeout_warn: Optional[bool] = True):
 	"""
 	Get information from a player
 	It's required to be executed in a separated thread. It can not be invoked on the task executor thread of MCDR
@@ -243,36 +263,36 @@ def get_player_info(player: str, data_path: str = '', *, timeout: Optional[float
 	"""
 	if timeout is None:
 		timeout = DEFAULT_TIME_OUT
-	return player_data_getter.get_player_info(player, data_path, timeout)
+	return player_data_getter.get_player_info(player, data_path, timeout, timeout_warn)
 
 
 Coordinate = collections.namedtuple('Coordinate', 'x y z')
 
 
-def get_player_coordinate(player: str, *, timeout: Optional[float] = None) -> Union[int or str]:
+def get_player_coordinate(player: str, *, timeout: Optional[float] = None, timeout_warn: Optional[bool] = True) -> Union[int or str]:
 	"""
 	Return the coordinate of a player
 	The return value is a tuple with 3 elements (x, y, z). Each element is a float
 	The return value is also a namedtuple, you can use coord.x, coord.y, coord.z to access the value
 	"""
-	pos = get_player_info(player, 'Pos', timeout=timeout)
+	pos = get_player_info(player, 'Pos', timeout=timeout, timeout_warn=timeout_warn)
 	if pos is None:
 		raise ValueError('Fail to query the coordinate of player {}'.format(player))
 	return Coordinate(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
 
 
-def get_player_dimension(player: str, *, timeout: Optional[float] = None) -> Union[int or str]:
+def get_player_dimension(player: str, *, timeout: Optional[float] = None, timeout_warn: Optional[bool] = True) -> Union[int or str]:
 	"""
 	Return the dimension of a player and return an int representing the dimension. Compatible with MC 1.16
 	If the dim result is a str, the server should be in 1.16, and it will convert the dimension name into the old integer
-	format if the dimension is overworld, nether or the end. Otherwise the origin dimension name str is returned
+ 	format if the dimension is overworld, nether or the end. Otherwise the origin dimension name str is returned
 	"""
 	dim_convert = {
 		'minecraft:overworld': 0,
 		'minecraft:the_nether': -1,
 		'minecraft:the_end': 1
 	}
-	dim = get_player_info(player, 'Dimension', timeout=timeout)
+	dim = get_player_info(player, 'Dimension', timeout=timeout, timeout_warn=timeout_warn)
 	if dim is None:
 		raise ValueError('Fail to query the dimension of player {}'.format(player))
 	if type(dim) is str:  # 1.16+
